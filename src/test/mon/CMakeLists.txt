@@ -88,3 +88,10 @@ add_executable(unittest_mon_election
   )
 add_ceph_unittest(unittest_mon_election)
 target_link_libraries(unittest_mon_election mon global)
+
+# unittest_mon_kvmonitor
+add_executable(unittest_mon_kvmonitor
+  test_kvmonitor.cc
+  )
+add_ceph_unittest(unittest_mon_kvmonitor)
+target_link_libraries(unittest_mon_kvmonitor mon global)
