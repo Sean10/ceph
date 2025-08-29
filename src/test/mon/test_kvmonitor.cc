@@ -55,46 +55,21 @@ public:
    */
   static void decode_pending_data(
     ceph::buffer::list& bl,
+    bool can_use_range_ops,
     std::map<std::string, std::optional<ceph::buffer::list>>& key_ops,
     std::vector<KVMonitor::RangeDeleteOp>& range_ops
   ) {
     auto p = bl.cbegin();
-    
-    // This is the exact logic from KVMonitor::maybe_send_update lines 642-675
-    
-    // Handle both legacy and versioned formats
-    // Try to detect if this is a versioned format by peeking at the structure
-    bool has_version_header = false;
-    
-    // Peek at the data to determine format
-    if (p.get_remaining() >= 3) {  // Minimum for version header
-      auto peek_p = p;
-      try {
-        __u8 potential_v, potential_compat;
-        decode(potential_v, peek_p);
-        decode(potential_compat, peek_p);
-        // Heuristic: version should be reasonable (1-10) and compat <= version
-        if (potential_v >= 1 && potential_v <= 10 && potential_compat <= potential_v) {
-          has_version_header = true;
-        }
-      } catch (...) {
-        // If peek fails, assume legacy format
-        has_version_header = false;
-      }
-    }
-    
-    if (has_version_header) {
-      // New versioned format
+    if (can_use_range_ops) {
       DECODE_START_LEGACY_COMPAT_LEN(2, 1, 1, p);
-      decode(key_ops, p);  
+      decode(key_ops, p);
       if (struct_v >= 2) {
-        decode(range_ops, p);  
+        decode(range_ops, p);
       }
       DECODE_FINISH(p);
     } else {
-      // Legacy format (no version header)
+      // Legacy format (no version header, only key_ops)
       decode(key_ops, p);
-      // range_ops remains empty for legacy format
     }
   }
 };
@@ -149,10 +124,10 @@ TEST_F(KVMonitorTest, VersionedFormat_WithRangeFeature) {
   ceph::buffer::list bl;
   KVMonitorEncodingHelper::encode_pending_data(key_ops, range_ops, true, bl);
   
-  // Decode using the EXACT logic from KVMonitor::maybe_send_update
+  // Decode using can_use_range_ops path selection (no heuristic)
   std::map<std::string,std::optional<ceph::buffer::list>> decoded_key_ops;
   std::vector<KVMonitor::RangeDeleteOp> decoded_range_ops;
-  KVMonitorEncodingHelper::decode_pending_data(bl, decoded_key_ops, decoded_range_ops);
+  KVMonitorEncodingHelper::decode_pending_data(bl, true, decoded_key_ops, decoded_range_ops);
   
   // Verify key operations
   EXPECT_EQ(key_ops.size(), decoded_key_ops.size());
@@ -188,10 +163,10 @@ TEST_F(KVMonitorTest, BackwardCompatibility_WithoutRangeFeature) {
   ceph::buffer::list bl;
   KVMonitorEncodingHelper::encode_pending_data(key_ops, range_ops, false, bl);
   
-  // Decode using EXACT logic from KVMonitor
+  // Decode using can_use_range_ops=false (legacy)
   std::map<std::string,std::optional<ceph::buffer::list>> decoded_key_ops;
   std::vector<KVMonitor::RangeDeleteOp> decoded_range_ops;
-  KVMonitorEncodingHelper::decode_pending_data(bl, decoded_key_ops, decoded_range_ops);
+  KVMonitorEncodingHelper::decode_pending_data(bl, false, decoded_key_ops, decoded_range_ops);
   
   // Verify
   EXPECT_EQ(key_ops.size(), decoded_key_ops.size());
@@ -209,10 +184,10 @@ TEST_F(KVMonitorTest, EmptyOperations_WithRangeFeature) {
   ceph::buffer::list bl;
   KVMonitorEncodingHelper::encode_pending_data(empty_key_ops, empty_range_ops, true, bl);
   
-  // Decode using EXACT logic from KVMonitor
+  // Decode using can_use_range_ops=true
   std::map<std::string,std::optional<ceph::buffer::list>> decoded_key_ops;
   std::vector<KVMonitor::RangeDeleteOp> decoded_range_ops;
-  KVMonitorEncodingHelper::decode_pending_data(bl, decoded_key_ops, decoded_range_ops);
+  KVMonitorEncodingHelper::decode_pending_data(bl, true, decoded_key_ops, decoded_range_ops);
   
   // Verify
   EXPECT_TRUE(decoded_key_ops.empty());
@@ -228,10 +203,10 @@ TEST_F(KVMonitorTest, EmptyOperations_WithoutRangeFeature) {
   ceph::buffer::list bl;
   KVMonitorEncodingHelper::encode_pending_data(empty_key_ops, empty_range_ops, false, bl);
   
-  // Decode using EXACT logic from KVMonitor
+  // Decode using can_use_range_ops=false
   std::map<std::string,std::optional<ceph::buffer::list>> decoded_key_ops;
   std::vector<KVMonitor::RangeDeleteOp> decoded_range_ops;
-  KVMonitorEncodingHelper::decode_pending_data(bl, decoded_key_ops, decoded_range_ops);
+  KVMonitorEncodingHelper::decode_pending_data(bl, false, decoded_key_ops, decoded_range_ops);
   
   // Verify
   EXPECT_TRUE(decoded_key_ops.empty());
@@ -275,10 +250,10 @@ TEST_F(KVMonitorTest, FeatureFlagCompatibility) {
     ceph::buffer::list bl_with_feature;
     KVMonitorEncodingHelper::encode_pending_data(key_ops, range_ops, true, bl_with_feature);
     
-    // Decode and verify range operations are preserved
+    // Decode and verify range operations are preserved (feature=true)
     std::map<std::string,std::optional<ceph::buffer::list>> decoded_key_ops;
     std::vector<KVMonitor::RangeDeleteOp> decoded_range_ops;
-    KVMonitorEncodingHelper::decode_pending_data(bl_with_feature, decoded_key_ops, decoded_range_ops);
+    KVMonitorEncodingHelper::decode_pending_data(bl_with_feature, true, decoded_key_ops, decoded_range_ops);
     
     EXPECT_EQ(1, decoded_range_ops.size());
     EXPECT_EQ("prefix1", decoded_range_ops[0].prefix);
@@ -291,78 +266,17 @@ TEST_F(KVMonitorTest, FeatureFlagCompatibility) {
     ceph::buffer::list bl_without_feature;
     KVMonitorEncodingHelper::encode_pending_data(key_ops, range_ops, false, bl_without_feature);
     
-    // Decode using EXACT format detection from KVMonitor
+    // Decode using can_use_range_ops=false
     std::map<std::string,std::optional<ceph::buffer::list>> decoded_key_ops;
     std::vector<KVMonitor::RangeDeleteOp> decoded_range_ops;
-    KVMonitorEncodingHelper::decode_pending_data(bl_without_feature, decoded_key_ops, decoded_range_ops);
+    KVMonitorEncodingHelper::decode_pending_data(bl_without_feature, false, decoded_key_ops, decoded_range_ops);
     
     EXPECT_EQ(1, decoded_key_ops.size());
     EXPECT_TRUE(decoded_range_ops.empty());  // Range ops not supported in legacy
   }
 }
 
-// Test format detection edge cases
-TEST_F(KVMonitorTest, FormatDetectionEdgeCases) {
-  // Test 1: Detect versioned format correctly
-  {
-    std::map<std::string,std::optional<ceph::buffer::list>> key_ops;
-    std::vector<KVMonitor::RangeDeleteOp> range_ops;
-    
-    ceph::buffer::list bl;
-    KVMonitorEncodingHelper::encode_pending_data(key_ops, range_ops, true, bl);
-    
-    // The encoded data should be detected as versioned format
-    std::map<std::string,std::optional<ceph::buffer::list>> decoded_key_ops;
-    std::vector<KVMonitor::RangeDeleteOp> decoded_range_ops;
-    
-    // This should not throw and should properly decode as versioned format
-    EXPECT_NO_THROW(KVMonitorEncodingHelper::decode_pending_data(bl, decoded_key_ops, decoded_range_ops));
-    EXPECT_TRUE(decoded_key_ops.empty());
-    EXPECT_TRUE(decoded_range_ops.empty());
-  }
-  
-  // Test 2: Detect legacy format correctly
-  {
-    std::map<std::string,std::optional<ceph::buffer::list>> key_ops;
-    std::vector<KVMonitor::RangeDeleteOp> range_ops;
-    
-    ceph::buffer::list val;
-    val.append("test_value");
-    key_ops["test_key"] = val;
-    
-    ceph::buffer::list bl;
-    KVMonitorEncodingHelper::encode_pending_data(key_ops, range_ops, false, bl);
-    
-    // The encoded data should be detected as legacy format
-    std::map<std::string,std::optional<ceph::buffer::list>> decoded_key_ops;
-    std::vector<KVMonitor::RangeDeleteOp> decoded_range_ops;
-    
-    EXPECT_NO_THROW(KVMonitorEncodingHelper::decode_pending_data(bl, decoded_key_ops, decoded_range_ops));
-    EXPECT_EQ(1, decoded_key_ops.size());
-    EXPECT_TRUE(decoded_range_ops.empty());
-  }
-  
-  // Test 3: Handle malformed data gracefully
-  {
-    ceph::buffer::list bl;
-    // Add some random bytes that shouldn't be valid encoding
-    bl.append("invalid_data_here");
-    
-    std::map<std::string,std::optional<ceph::buffer::list>> decoded_key_ops;
-    std::vector<KVMonitor::RangeDeleteOp> decoded_range_ops;
-    
-    // This should either succeed (if treated as legacy) or throw a decode exception
-    // Either way, it shouldn't crash
-    bool caught_exception = false;
-    try {
-      KVMonitorEncodingHelper::decode_pending_data(bl, decoded_key_ops, decoded_range_ops);
-    } catch (...) {
-      caught_exception = true;
-    }
-    // We don't assert the outcome since malformed data behavior can vary
-    // The important thing is that it doesn't crash
-  }
-}
+// (Removed) Format detection edge cases: decoding now follows can_use_range_ops explicitly
 
 int main(int argc, char **argv) {
   auto args = argv_to_vec(argc, (const char **)argv);
